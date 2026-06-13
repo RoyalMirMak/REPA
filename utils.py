@@ -49,6 +49,143 @@ def fix_mocov3_state_dict(state_dict):
         )
     return state_dict
 
+
+def get_dinov2_model_path(model_name: str) -> str:
+    """
+    Get the path to a DINOv2 model weight file.
+    
+    Checks the following locations in order:
+    1. DINOV2_WEIGHTS_DIR environment variable (if set)
+    2. ./REPA/ckpts/dinov2/ (relative to project root)
+    3. ./ckpts/dinov2/ (relative to current directory)
+    
+    Args:
+        model_name: Model name (e.g., 'dinov2_vitb14_pretrain.pth')
+    
+    Returns:
+        Full path to the weight file
+    
+    Raises:
+        FileNotFoundError: If the weight file is not found
+    """
+    # Check environment variable first
+    weights_dir = os.environ.get('DINOV2_WEIGHTS_DIR')
+    if weights_dir:
+        path = os.path.join(weights_dir, model_name)
+        if os.path.isfile(path):
+            return path
+    
+    # Check relative paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    
+    # Try ./REPA/ckpts/dinov2/
+    path = os.path.join(project_root, 'REPA', 'ckpts', 'dinov2', model_name)
+    if os.path.isfile(path):
+        return path
+    
+    # Try ./ckpts/dinov2/
+    path = os.path.join(script_dir, 'ckpts', 'dinov2', model_name)
+    if os.path.isfile(path):
+        return path
+    
+    raise FileNotFoundError(
+        f"DINOv2 weights not found at any of the expected locations.\n"
+        f"Please download weights using: bash scripts/download_dinov2_weights.sh\n"
+        f"Or set DINOV2_WEIGHTS_DIR environment variable.\n"
+        f"Searched:\n  - {weights_dir or '(DINOV2_WEIGHTS_DIR not set)'}\n"
+        f"  - {path}"
+    )
+
+
+def _load_dinov2_from_weights(model_name: str, img_size: int = 224):
+    """
+    Load DINOv2 model from local weight file using a timm backbone.
+    """
+    import timm
+
+    model_configs = {
+        'dinov2_vitb14':     ('dinov2_vitb14_pretrain.pth',       'vit_base_patch14_dinov2'),
+        'dinov2_vitl14':     ('dinov2_vitl14_pretrain.pth',       'vit_large_patch14_dinov2'),
+        'dinov2_vitg14':     ('dinov2_vitg14_pretrain.pth',       'vit_giant_patch14_dinov2'),
+        'dinov2_vitb14_reg': ('dinov2_vitb14_reg4_pretrain.pth',  'vit_base_patch14_reg4_dinov2'),
+        'dinov2_vitl14_reg': ('dinov2_vitl14_reg4_pretrain.pth',  'vit_large_patch14_reg4_dinov2'),
+        'dinov2_vitg14_reg': ('dinov2_vitg14_reg4_pretrain.pth',  'vit_giant_patch14_reg4_dinov2'),
+    }
+
+    if model_name not in model_configs:
+        raise ValueError(f"Unknown DINOv2 model: {model_name}")
+
+    weight_file, model_type = model_configs[model_name]
+    weight_path = get_dinov2_model_path(weight_file)
+
+    # Build timm backbone at the resolution REPA actually feeds in (16*14 = 224).
+    encoder = timm.create_model(model_type, pretrained=False, img_size=img_size)
+
+    print(f"Loading DINOv2 weights from {weight_path}")
+    state_dict = torch.load(weight_path, map_location='cpu', weights_only=True)
+
+    if isinstance(state_dict, dict) and 'teacher' in state_dict:
+        state_dict = state_dict['teacher']
+    elif isinstance(state_dict, dict) and 'student' in state_dict:
+        state_dict = state_dict['student']
+
+    # Map FAIR keys -> timm keys
+    remapped = {}
+    for k, v in state_dict.items():
+        nk = k
+        if nk.startswith('module.'):
+            nk = nk[len('module.'):]
+        if nk.startswith('backbone.'):
+            nk = nk[len('backbone.'):]
+        nk = nk.replace('.mlp.w12.', '.mlp.fc1.')
+        nk = nk.replace('.mlp.w3.',  '.mlp.fc2.')
+        remapped[nk] = v
+
+    # Drop keys that timm's backbone doesn't have
+    remapped = {k: v for k, v in remapped.items() if k not in {'mask_token'}}
+
+    # Resample pos_embed (518/14=37 grid in FAIR weights -> img_size/14 grid in timm)
+    if 'pos_embed' in remapped:
+        num_prefix_tokens = getattr(encoder, 'num_prefix_tokens', 1)
+        new_grid = img_size // 14
+        remapped['pos_embed'] = timm.layers.pos_embed.resample_abs_pos_embed(
+            remapped['pos_embed'],
+            new_size=[new_grid, new_grid],
+            num_prefix_tokens=num_prefix_tokens,
+        )
+
+    missing, unexpected = encoder.load_state_dict(remapped, strict=False)
+    missing    = [k for k in missing    if not k.startswith('head')]
+    unexpected = [k for k in unexpected if not k.startswith('head')]
+    if missing or unexpected:
+        print(f"[DINOv2] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        print(f"[DINOv2] unexpected  : {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        raise RuntimeError(
+            f"State dict mismatch when loading {model_name}: "
+            f"{len(missing)} missing, {len(unexpected)} unexpected"
+        )
+
+    # Patch forward_features to return a FAIR-style dict expected by REPA's train.py
+    num_prefix_tokens = getattr(encoder, 'num_prefix_tokens', 1)  # 1 for non-reg, 5 for reg4
+    timm_forward_features = encoder.forward_features
+
+    def forward_features_dinov2_style(x):
+        feats = timm_forward_features(x)            # [B, P + N, C]
+        cls   = feats[:, 0]                          # [B, C]
+        patch = feats[:, num_prefix_tokens:]         # [B, N, C]
+        return {
+            'x_norm_clstoken':    cls,
+            'x_norm_patchtokens': patch,
+            'x_prenorm':          feats,             # not pre-norm, but kept for API compat
+            'masks':              None,
+        }
+
+    encoder.forward_features = forward_features_dinov2_style
+
+    print(f"✓ Loaded DINOv2 {model_name} from {weight_path} (img_size={img_size})")
+    return encoder
+
 @torch.no_grad()
 def load_encoders(enc_type, device, resolution=256):
     assert (resolution == 256) or (resolution == 512)
@@ -87,15 +224,25 @@ def load_encoders(enc_type, device, resolution=256):
 
         elif 'dinov2' in encoder_type:
             import timm
+            # Load DINOv2 from local weights (no torch.hub to avoid race conditions)
             if 'reg' in encoder_type:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                model_name = 'dinov2_vitb14_reg' if model_config == 'b' else \
+                             'dinov2_vitl14_reg' if model_config == 'l' else \
+                             'dinov2_vitg14_reg'
             else:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+                model_name = 'dinov2_vitb14' if model_config == 'b' else \
+                             'dinov2_vitl14' if model_config == 'l' else \
+                             'dinov2_vitg14'
+            
+            # Load from local weights file
+            # REPA feeds DINOv2 at (resolution // 256) * 224 (i.e. 224 for res=256, 448 for res=512)
+            dinov2_input = 224 if resolution == 256 else 448
+            encoder = _load_dinov2_from_weights(model_name, img_size=dinov2_input)
             del encoder.head
-            patch_resolution = 16 * (resolution // 256)
-            encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
-                encoder.pos_embed.data, [patch_resolution, patch_resolution],
-            )
+            # patch_resolution = 16 * (resolution // 256)
+            # encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
+            #     encoder.pos_embed.data, [patch_resolution, patch_resolution],
+            # )
             encoder.head = torch.nn.Identity()
             encoder = encoder.to(device)
             encoder.eval()

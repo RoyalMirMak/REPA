@@ -437,6 +437,7 @@ def main(args):
             total_val    = accelerator.gather(total_loss).mean().detach().item()
             denoise_val  = accelerator.gather(denoising_mean).mean().detach().item()
             proj_val     = accelerator.gather(proj_mean).mean().detach().item()
+            # div_loss is now always same shape as denoising_loss (handled in loss.py)
             div_val      = accelerator.gather(div_mean).mean().detach().item()
             gn_val       = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 

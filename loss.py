@@ -49,7 +49,7 @@ class SILoss:
             raise NotImplementedError()
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def covariance_loss(self, zs_tilde):
+    def covariance_loss(self, zs_tilde, batch_size=None):
         """
         Off-diagonal covariance decorrelation loss (Barlow Twins / VICReg cov term).
 
@@ -80,13 +80,15 @@ class SILoss:
 
         Args:
             zs_tilde: list of tensors, each (B, T, D)
+            batch_size: optional batch size for shape compatibility when zs_tilde is empty
 
         Returns:
             scalar tensor with gradients intact
         """
         if not zs_tilde or self.div_coeff == 0.0:
-            device = zs_tilde[0].device if zs_tilde else torch.device('cpu')
-            return zs_tilde[0].sum() * 0.0 if zs_tilde else torch.tensor(0.0, device=device)
+            device = zs_tilde[0].device if zs_tilde and len(zs_tilde) > 0 else torch.device('cpu')
+            # Return scalar zero on correct device - will be expanded by caller
+            return torch.tensor(0.0, device=device)
 
         total = None
         count = 0
@@ -159,7 +161,11 @@ class SILoss:
         # Operates on normalized features → orthogonal to proj_loss.
         # Does not collapse regardless of div_coeff magnitude.
         # Broadcast to per-sample shape so accelerator.gather() works in train.py.
-        cov_loss_scalar = self.covariance_loss(zs_tilde)
-        div_loss = cov_loss_scalar.expand(denoising_loss.shape[0])
+        if self.div_coeff == 0.0 or not zs_tilde:
+            # Return zero tensor with same shape as denoising_loss for gather compatibility
+            div_loss = torch.zeros_like(denoising_loss)
+        else:
+            cov_loss_scalar = self.covariance_loss(zs_tilde)
+            div_loss = cov_loss_scalar.expand(denoising_loss.shape[0])
 
         return denoising_loss, proj_loss, div_loss
